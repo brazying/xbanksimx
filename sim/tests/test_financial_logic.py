@@ -1,0 +1,168 @@
+import sqlite3
+import unittest
+
+from database import cash_balance, portfolio_totals
+
+
+class FinancialLogicTests(unittest.TestCase):
+    def setUp(self):
+        self.conn = sqlite3.connect(":memory:")
+        self.conn.row_factory = sqlite3.Row
+        self.conn.executescript("""
+            CREATE TABLE transactions(tx_type TEXT, amount_cents INTEGER);
+            CREATE TABLE trades(side TEXT, total_cents INTEGER);
+            CREATE TABLE bond_trades(side TEXT, total_cents INTEGER);
+            CREATE TABLE bond_coupon_payments(amount_cents INTEGER);
+            CREATE TABLE bond_redemptions(amount_cents INTEGER);
+            CREATE TABLE manual_asset_trades(side TEXT, amount_cents INTEGER);
+
+            CREATE TABLE assets(
+                name TEXT, ticker TEXT, quantity REAL,
+                average_price_cents INTEGER, current_price_cents INTEGER
+            );
+            CREATE TABLE stocks(ticker TEXT, name TEXT, price_cents INTEGER);
+            CREATE TABLE holdings(ticker TEXT, quantity REAL, average_price_cents INTEGER);
+            CREATE TABLE bonds(ticker TEXT, name TEXT, price_cents INTEGER);
+            CREATE TABLE bond_holdings(ticker TEXT, quantity REAL, average_price_cents INTEGER);
+        """)
+
+    def tearDown(self):
+        self.conn.close()
+
+    def test_cash_balance_combines_all_ledger_sources(self):
+        self.conn.executemany(
+            "INSERT INTO transactions(tx_type,amount_cents) VALUES(?,?)",
+            [("Income", 1_000_000), ("Deposit", 20_000), ("Expense", 5_000)],
+        )
+        self.conn.executemany(
+            "INSERT INTO trades(side,total_cents) VALUES(?,?)",
+            [("BUY", 10_000), ("SELL", 12_000)],
+        )
+        self.conn.executemany(
+            "INSERT INTO bond_trades(side,total_cents) VALUES(?,?)",
+            [("BUY", 30_000), ("SELL", 31_000)],
+        )
+        self.conn.execute("INSERT INTO bond_coupon_payments VALUES(1000)")
+        self.conn.execute("INSERT INTO bond_redemptions VALUES(100000)")
+
+        self.conn.execute("INSERT INTO manual_asset_trades VALUES('BUY',5000)")
+        self.assertEqual(cash_balance(self.conn), 1_114_000)
+
+    def test_portfolio_values_market_positions_once(self):
+        self.conn.executemany(
+            "INSERT INTO assets VALUES(?,?,?,?,?)",
+            [
+                ("Manual Apple", "AAPL", 2, 100, 110),
+                ("Manual bond", "OFZ-TEST", 4, 90, 95),
+                ("Gold", "", 1, 400, 500),
+            ],
+        )
+        self.conn.execute("INSERT INTO stocks VALUES('AAPL','Apple',250)")
+        self.conn.execute("INSERT INTO holdings VALUES('AAPL',1,200)")
+        self.conn.execute("INSERT INTO bonds VALUES('OFZ-TEST','Test OFZ',105)")
+        self.conn.execute("INSERT INTO bond_holdings VALUES('OFZ-TEST',3,100)")
+
+        positions, cost, value = portfolio_totals(self.conn)
+
+        self.assertEqual(len(positions), 3)
+        self.assertEqual(cost, 900)
+        self.assertEqual(value, 1_065)
+        self.assertEqual(
+            {position[1] for position in positions},
+            {"", "AAPL", "OFZ-TEST"},
+        )
+
+
+class FinanceInputTests(unittest.TestCase):
+    def test_compound_interest_handles_large_supported_values(self):
+        from finance import compound_interest
+
+        result = compound_interest(100_000_000, 100, 50, 1)
+        self.assertEqual(result, 100_000_000 * (2 ** 50))
+
+    def test_compound_interest_handles_maximum_calculator_values(self):
+        from finance import compound_interest
+
+        result = compound_interest(100_000_000_000, 100, 100, 365)
+        self.assertGreater(result, 100_000_000_000)
+
+    def test_projected_value_rejects_rate_below_minus_100_percent(self):
+        from finance import projected_value
+
+        with self.assertRaisesRegex(ValueError, "-100"):
+            projected_value(1_000_000, -150, 1)
+
+    def test_projected_value_allows_minus_100_percent(self):
+        from finance import projected_value
+
+        self.assertEqual(projected_value(1_000_000, -100, 1), 0)
+        self.assertEqual(projected_value(1_000_000, -100, 0), 1_000_000)
+
+    def test_to_cents_reports_invalid_input_as_value_error(self):
+        from finance import to_cents
+
+        for value in ("abc", "NaN", "Infinity"):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    to_cents(value)
+
+    def test_compound_interest_handles_daily_compounding_at_large_values(self):
+        from finance import compound_interest
+
+        result = compound_interest(100_000_000, 100, 50, 365)
+        self.assertGreater(result, 10 ** 28)
+
+
+class MoneyFormattingTests(unittest.TestCase):
+    def test_money_preserves_large_amount_precision(self):
+        from finance import money
+
+        self.assertEqual(
+            money(12345678901234567890123456),
+            "123 456 789 012 345 678 901 234.56 ₽",
+        )
+
+    def test_money_formats_negative_values(self):
+        from finance import money
+
+        self.assertEqual(money(-12345), "-123.45 ₽")
+
+    def test_to_cents_preserves_large_decimal_input(self):
+        from finance import to_cents
+
+        self.assertEqual(
+            to_cents("123456789012345678901234567890.12"),
+            12345678901234567890123456789012,
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+class CouponAccrualTests(unittest.TestCase):
+    def test_buying_one_day_before_coupon_only_earns_one_day(self):
+        from finance import coupon_accrual_cents
+
+        trades = [{
+            "id": 1, "trade_date": "2026-12-31T12:00:00",
+            "side": "BUY", "quantity": 1.0,
+        }]
+        amount, average_quantity = coupon_accrual_cents(
+            trades, 100_000, 10.0, "2026-07-01", "2027-01-01"
+        )
+        self.assertEqual(amount, round((100_000 * 0.10 / 2) / 184))
+        self.assertAlmostEqual(average_quantity, 1 / 184)
+
+    def test_full_period_holding_earns_full_coupon(self):
+        from finance import coupon_accrual_cents
+
+        trades = [{
+            "id": 1, "trade_date": "2026-06-30T12:00:00",
+            "side": "BUY", "quantity": 2.0,
+        }]
+        amount, average_quantity = coupon_accrual_cents(
+            trades, 100_000, 10.0, "2026-07-01", "2027-01-01"
+        )
+        self.assertEqual(amount, 10_000)
+        self.assertAlmostEqual(average_quantity, 2.0)

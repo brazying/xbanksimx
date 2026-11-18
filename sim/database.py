@@ -1,8 +1,22 @@
 import sqlite3
 from pathlib import Path
-from datetime import date
+from datetime import date, datetime
+import calendar
 
-DB_PATH = Path(__file__).parent / "data" / "ledger.sqlite3"
+
+def add_months(value, months):
+    month_index = value.month - 1 + months
+    year = value.year + month_index // 12
+    month = month_index % 12 + 1
+    day = min(value.day, calendar.monthrange(year, month)[1])
+    return value.replace(year=year, month=month, day=day)
+
+# В собранной Windows-версии база хранится рядом с EXE, а не во временной папке PyInstaller.
+import sys
+if getattr(sys, "frozen", False):
+    DB_PATH = Path(sys.executable).resolve().parent / "data" / "ledger.sqlite3"
+else:
+    DB_PATH = Path(__file__).parent / "data" / "ledger.sqlite3"
 
 def connect():
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -30,6 +44,13 @@ def init_db():
             average_price_cents INTEGER NOT NULL DEFAULT 0 CHECK(average_price_cents >= 0),
             current_price_cents INTEGER NOT NULL DEFAULT 0 CHECK(current_price_cents >= 0)
         );
+        CREATE TABLE IF NOT EXISTS manual_asset_trades (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            trade_date TEXT NOT NULL,
+            asset_name TEXT NOT NULL,
+            side TEXT NOT NULL CHECK(side IN ('BUY','SELL')),
+            amount_cents INTEGER NOT NULL CHECK(amount_cents > 0)
+        );
         CREATE TABLE IF NOT EXISTS deposit_scenarios (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             principal_cents INTEGER NOT NULL,
@@ -47,6 +68,19 @@ def init_db():
             final_cents INTEGER NOT NULL,
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
+        CREATE TABLE IF NOT EXISTS market_clock (
+            id INTEGER PRIMARY KEY CHECK(id=1),
+            simulated_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS stock_price_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ticker TEXT NOT NULL REFERENCES stocks(ticker),
+            simulated_at TEXT NOT NULL,
+            price_cents INTEGER NOT NULL CHECK(price_cents>0),
+            UNIQUE(ticker, simulated_at)
+        );
+        CREATE INDEX IF NOT EXISTS idx_stock_history_ticker_time
+            ON stock_price_history(ticker, simulated_at);
         CREATE TABLE IF NOT EXISTS stocks (
             ticker TEXT PRIMARY KEY,
             name TEXT NOT NULL,
@@ -67,9 +101,108 @@ def init_db():
             side TEXT NOT NULL CHECK(side IN ('BUY','SELL')),
             quantity REAL NOT NULL CHECK(quantity > 0),
             price_cents INTEGER NOT NULL CHECK(price_cents > 0),
-            total_cents INTEGER NOT NULL CHECK(total_cents > 0)
+            total_cents INTEGER NOT NULL CHECK(total_cents > 0),
+            realized_pnl_cents INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS bonds (
+            ticker TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            issuer_type TEXT NOT NULL CHECK(issuer_type IN ('Государственная','Корпоративная')),
+            face_value_cents INTEGER NOT NULL CHECK(face_value_cents > 0),
+            price_cents INTEGER NOT NULL CHECK(price_cents > 0),
+            previous_price_cents INTEGER NOT NULL CHECK(previous_price_cents > 0),
+            coupon_rate REAL NOT NULL CHECK(coupon_rate >= 0),
+            maturity_date TEXT NOT NULL,
+            next_coupon_date TEXT NOT NULL,
+            volatility REAL NOT NULL DEFAULT 0.001
+        );
+        CREATE TABLE IF NOT EXISTS bond_holdings (
+            ticker TEXT PRIMARY KEY REFERENCES bonds(ticker),
+            quantity REAL NOT NULL DEFAULT 0 CHECK(quantity >= 0),
+            average_price_cents INTEGER NOT NULL DEFAULT 0 CHECK(average_price_cents >= 0)
+        );
+        CREATE TABLE IF NOT EXISTS bond_trades (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            trade_date TEXT NOT NULL,
+            ticker TEXT NOT NULL REFERENCES bonds(ticker),
+            side TEXT NOT NULL CHECK(side IN ('BUY','SELL')),
+            quantity REAL NOT NULL CHECK(quantity > 0),
+            price_cents INTEGER NOT NULL CHECK(price_cents > 0),
+            total_cents INTEGER NOT NULL CHECK(total_cents > 0),
+            realized_pnl_cents INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS bond_coupon_payments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            payment_date TEXT NOT NULL,
+            ticker TEXT NOT NULL REFERENCES bonds(ticker),
+            quantity REAL NOT NULL,
+            amount_cents INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS bond_redemptions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            payment_date TEXT NOT NULL,
+            ticker TEXT NOT NULL REFERENCES bonds(ticker),
+            quantity REAL NOT NULL,
+            amount_cents INTEGER NOT NULL,
+            realized_pnl_cents INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS financial_snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            captured_at TEXT NOT NULL,
+            cash_cents INTEGER NOT NULL,
+            portfolio_cost_cents INTEGER NOT NULL,
+            portfolio_value_cents INTEGER NOT NULL,
+            net_worth_cents INTEGER NOT NULL
         );
         """)
+        trade_columns = {row["name"] for row in conn.execute("PRAGMA table_info(trades)")}
+        if "realized_pnl_cents" not in trade_columns:
+            conn.execute("ALTER TABLE trades ADD COLUMN realized_pnl_cents INTEGER NOT NULL DEFAULT 0")
+            # Восстанавливаем историческую реализованную прибыль для старых сделок
+            # по методу средневзвешенной себестоимости.
+            positions = {}
+            legacy_trades = conn.execute(
+                "SELECT id,ticker,side,quantity,price_cents FROM trades ORDER BY trade_date,id"
+            ).fetchall()
+            for trade in legacy_trades:
+                qty, average = positions.get(trade["ticker"], (0.0, 0.0))
+                if trade["side"] == "BUY":
+                    new_qty = qty + trade["quantity"]
+                    new_average = (
+                        (qty * average + trade["quantity"] * trade["price_cents"]) / new_qty
+                        if new_qty else 0.0
+                    )
+                    positions[trade["ticker"]] = (new_qty, new_average)
+                else:
+                    realized = int(round(trade["quantity"] * (trade["price_cents"] - average)))
+                    conn.execute(
+                        "UPDATE trades SET realized_pnl_cents=? WHERE id=?",
+                        (realized, trade["id"])
+                    )
+                    positions[trade["ticker"]] = (max(0.0, qty - trade["quantity"]), average)
+
+        bond_trade_columns = {row["name"] for row in conn.execute("PRAGMA table_info(bond_trades)")}
+        if "realized_pnl_cents" not in bond_trade_columns:
+            conn.execute("ALTER TABLE bond_trades ADD COLUMN realized_pnl_cents INTEGER NOT NULL DEFAULT 0")
+            positions = {}
+            legacy_bond_trades = conn.execute(
+                "SELECT id,ticker,side,quantity,price_cents FROM bond_trades ORDER BY trade_date,id"
+            ).fetchall()
+            for trade in legacy_bond_trades:
+                qty, average = positions.get(trade["ticker"], (0.0, 0.0))
+                if trade["side"] == "BUY":
+                    new_qty = qty + trade["quantity"]
+                    new_average = ((qty * average + trade["quantity"] * trade["price_cents"]) / new_qty) if new_qty else 0.0
+                    positions[trade["ticker"]] = (new_qty, new_average)
+                else:
+                    realized = int(round(trade["quantity"] * (trade["price_cents"] - average)))
+                    conn.execute("UPDATE bond_trades SET realized_pnl_cents=? WHERE id=?", (realized, trade["id"]))
+                    positions[trade["ticker"]] = (max(0.0, qty - trade["quantity"]), average)
+
+        redemption_columns = {row["name"] for row in conn.execute("PRAGMA table_info(bond_redemptions)")}
+        if "realized_pnl_cents" not in redemption_columns:
+            conn.execute("ALTER TABLE bond_redemptions ADD COLUMN realized_pnl_cents INTEGER NOT NULL DEFAULT 0")
+
         stocks = [
             ("AAPL", "Apple Inc.", 23_000, 23_000, 0.010),
             ("MSFT", "Microsoft Corp.", 42_000, 42_000, 0.009),
@@ -80,9 +213,178 @@ def init_db():
             ("TSLA", "Tesla Inc.", 25_000, 25_000, 0.022),
             ("NFLX", "Netflix Inc.", 95_000, 95_000, 0.018),
         ]
+        stocks.extend([
+            ("ORCL","Oracle Corporation",19_500,19_500,0.012),
+            ("IBM","IBM",21_000,21_000,0.010),
+            ("INTC","Intel Corporation",4_300,4_300,0.018),
+            ("AMD","Advanced Micro Devices",14_000,14_000,0.020),
+            ("QCOM","Qualcomm",16_500,16_500,0.014),
+            ("ADBE","Adobe Inc.",52_000,52_000,0.016),
+            ("CRM","Salesforce",28_000,28_000,0.015),
+            ("UBER","Uber Technologies",7_500,7_500,0.019),
+            ("DIS","The Walt Disney Company",9_000,9_000,0.014),
+            ("KO","Coca-Cola",6_200,6_200,0.007),
+            ("PEP","PepsiCo",17_000,17_000,0.008),
+            ("WMT","Walmart",9_500,9_500,0.009),
+            ("COST","Costco",85_000,85_000,0.010),
+            ("JPM","JPMorgan Chase",24_000,24_000,0.012),
+            ("BAC","Bank of America",4_000,4_000,0.014),
+            ("V","Visa",31_000,31_000,0.011),
+            ("MA","Mastercard",48_000,48_000,0.011),
+            ("NKE","Nike",7_000,7_000,0.014),
+            ("SONY","Sony Group",8_500,8_500,0.013),
+            ("SAP","SAP SE",23_000,23_000,0.012),
+            ("BABA","Alibaba Group",8_000,8_000,0.019),
+            ("SHOP","Shopify",10_500,10_500,0.022),
+            ("PYPL","PayPal",6_500,6_500,0.018),
+            ("CSCO","Cisco Systems",6_000,6_000,0.010),
+        ])
         conn.executemany("INSERT OR IGNORE INTO stocks(ticker,name,price_cents,previous_price_cents,volatility) VALUES(?,?,?,?,?)", stocks)
+        from datetime import datetime
+        market_now = datetime.now().replace(minute=0, second=0, microsecond=0).isoformat(timespec="seconds")
+        conn.execute("INSERT OR IGNORE INTO market_clock(id,simulated_at) VALUES(1,?)", (market_now,))
+        conn.execute("""
+            INSERT OR IGNORE INTO stock_price_history(ticker,simulated_at,price_cents)
+            SELECT ticker, (SELECT simulated_at FROM market_clock WHERE id=1), price_cents
+            FROM stocks
+        """)
+
         conn.execute("INSERT OR IGNORE INTO holdings(ticker, quantity, average_price_cents) SELECT ticker, 0, 0 FROM stocks")
-        has_any = conn.execute("SELECT EXISTS(SELECT 1 FROM transactions) OR EXISTS(SELECT 1 FROM trades)").fetchone()[0]
+        from datetime import date
+        bond_rows = [
+            ("OFZ-26238","ОФЗ 26238","Государственная",100_000,98_500,98_500,7.1,5,0.0010),
+            ("OFZ-26240","ОФЗ 26240","Государственная",100_000,96_800,96_800,7.0,7,0.0012),
+            ("OFZ-26242","ОФЗ 26242","Государственная",100_000,101_200,101_200,8.0,4,0.0010),
+            ("OFZ-29025","ОФЗ 29025","Государственная",100_000,99_400,99_400,6.5,3,0.0008),
+            ("CORP-GAZP","Газпром БО-001Р","Корпоративная",1_000,1_012,1_012,9.2,3,0.0020),
+            ("CORP-ROSN","Роснефть 001Р","Корпоративная",1_000,995,995,8.7,4,0.0020),
+            ("CORP-RZD","РЖД 001Р","Корпоративная",1_000,1_018,1_018,8.4,5,0.0015),
+            ("CORP-SBER","Сбербанк 001Р","Корпоративная",1_000,1_006,1_006,8.9,3,0.0018),
+            ("CORP-MTS","МТС 001Р","Корпоративная",1_000,987,987,10.1,2,0.0025),
+            ("CORP-YNDX","Яндекс 001Р","Корпоративная",1_000,1_004,1_004,9.6,4,0.0024),
+        ]
+        clock_row = conn.execute("SELECT simulated_at FROM market_clock WHERE id=1").fetchone()
+        today = datetime.fromisoformat(clock_row["simulated_at"]).date()
+        for ticker,name,kind,face,price,prev,coupon,term,vol in bond_rows:
+            maturity = add_months(today, term * 12)
+            next_coupon = add_months(today, 6)
+            conn.execute(
+                """INSERT OR IGNORE INTO bonds(
+                    ticker,name,issuer_type,face_value_cents,price_cents,previous_price_cents,
+                    coupon_rate,maturity_date,next_coupon_date,volatility
+                ) VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                (ticker,name,kind,face,price,prev,coupon,maturity.isoformat(),next_coupon.isoformat(),vol)
+            )
+            conn.execute("INSERT OR IGNORE INTO bond_holdings(ticker,quantity,average_price_cents) VALUES(?,0,0)",(ticker,))
+
+        has_any = conn.execute("""
+            SELECT EXISTS(SELECT 1 FROM transactions)
+                OR EXISTS(SELECT 1 FROM trades)
+                OR EXISTS(SELECT 1 FROM bond_trades)
+                OR EXISTS(SELECT 1 FROM bond_coupon_payments)
+                OR EXISTS(SELECT 1 FROM bond_redemptions)
+        """).fetchone()[0]
         if not has_any:
-            conn.execute("INSERT INTO transactions(tx_date,tx_type,category,description,amount_cents) VALUES(?,?,?,?,?)",
-                         (date.today().isoformat(), "Income", "Стартовый капитал", "Начальный баланс для демонстрации торговли", 1_000_000))
+            seed_date = clock_row["simulated_at"]
+            conn.execute(
+                "INSERT INTO transactions(tx_date,tx_type,category,description,amount_cents) VALUES(?,?,?,?,?)",
+                (seed_date, "Income", "Стартовый капитал", "Начальный баланс для демонстрации торговли", 1_000_000)
+            )
+        record_financial_snapshot(conn)
+
+
+def simulated_datetime(conn):
+    """Текущее единое время симулятора (15 секунд реального времени = 1 час симуляции)."""
+    row = conn.execute("SELECT simulated_at FROM market_clock WHERE id=1").fetchone()
+    if row is None:
+        raise RuntimeError("Симулируемые часы ещё не инициализированы.")
+    return datetime.fromisoformat(row["simulated_at"])
+
+
+def cash_balance(conn):
+    """Единый источник истины для денежных средств на счёте."""
+    income = conn.execute(
+        "SELECT COALESCE(SUM(amount_cents),0) FROM transactions WHERE tx_type IN ('Income','Deposit')"
+    ).fetchone()[0]
+    expense = conn.execute(
+        "SELECT COALESCE(SUM(amount_cents),0) FROM transactions WHERE tx_type IN ('Expense','Withdrawal')"
+    ).fetchone()[0]
+    stock_cash = conn.execute(
+        "SELECT COALESCE(SUM(CASE WHEN side='SELL' THEN total_cents ELSE -total_cents END),0) FROM trades"
+    ).fetchone()[0]
+    bond_cash = conn.execute(
+        "SELECT COALESCE(SUM(CASE WHEN side='SELL' THEN total_cents ELSE -total_cents END),0) FROM bond_trades"
+    ).fetchone()[0]
+    coupons = conn.execute("SELECT COALESCE(SUM(amount_cents),0) FROM bond_coupon_payments").fetchone()[0]
+    redemptions = conn.execute("SELECT COALESCE(SUM(amount_cents),0) FROM bond_redemptions").fetchone()[0]
+    manual_assets = conn.execute(
+        "SELECT COALESCE(SUM(CASE WHEN side='SELL' THEN amount_cents ELSE -amount_cents END),0) "
+        "FROM manual_asset_trades"
+    ).fetchone()[0]
+    return int(income - expense + stock_cash + bond_cash + coupons + redemptions + manual_assets)
+
+
+
+def portfolio_positions(conn):
+    """Единый список открытых позиций без повторного учёта ручных активов."""
+    stock_rows = conn.execute("""
+        SELECT h.ticker,h.quantity,h.average_price_cents,s.price_cents,s.name
+        FROM holdings h JOIN stocks s ON s.ticker=h.ticker
+        WHERE h.quantity>0 ORDER BY h.ticker
+    """).fetchall()
+    bond_rows = conn.execute("""
+        SELECT h.ticker,h.quantity,h.average_price_cents,b.price_cents,b.name
+        FROM bond_holdings h JOIN bonds b ON b.ticker=h.ticker
+        WHERE h.quantity>0 ORDER BY h.ticker
+    """).fetchall()
+
+    market_tickers = {row["ticker"].upper() for row in stock_rows}
+    bond_tickers = {row["ticker"].upper() for row in bond_rows}
+    positions = []
+
+    for row in conn.execute("SELECT * FROM assets ORDER BY name").fetchall():
+        ticker = (row["ticker"] or "").strip().upper()
+        if ticker and (ticker in market_tickers or ticker in bond_tickers):
+            continue
+        positions.append((
+            row["name"], ticker, float(row["quantity"]),
+            int(row["average_price_cents"]), int(row["current_price_cents"]),
+            "Ручной актив"
+        ))
+
+    positions.extend((
+        row["name"], row["ticker"], float(row["quantity"]),
+        int(row["average_price_cents"]), int(row["price_cents"]), "Акции"
+    ) for row in stock_rows)
+    positions.extend((
+        row["name"] + " · облигация", row["ticker"], float(row["quantity"]),
+        int(row["average_price_cents"]), int(row["price_cents"]), "Облигации"
+    ) for row in bond_rows)
+
+    return positions
+
+
+def portfolio_totals(conn):
+    """Возвращает позиции, себестоимость и текущую рыночную стоимость в копейках."""
+    positions = portfolio_positions(conn)
+    cost = sum(int(round(qty * average)) for _, _, qty, average, _, _ in positions)
+    value = sum(int(round(qty * current)) for _, _, qty, _, current, _ in positions)
+    return positions, cost, value
+
+
+def record_financial_snapshot(conn):
+    """Сохранить снимок капитала с отметкой единого симулируемого времени."""
+
+    cash = cash_balance(conn)
+
+    _, portfolio_cost, portfolio_value = portfolio_totals(conn)
+    captured_at = simulated_datetime(conn).isoformat(timespec="seconds")
+    # Один снимок на один симулируемый час: повторные действия в тот же час
+    # обновляют его, а не создают дубли.
+    conn.execute("DELETE FROM financial_snapshots WHERE captured_at=?", (captured_at,))
+    conn.execute(
+        """INSERT INTO financial_snapshots(
+               captured_at,cash_cents,portfolio_cost_cents,portfolio_value_cents,net_worth_cents
+           ) VALUES(?,?,?,?,?)""",
+        (captured_at, cash, portfolio_cost, portfolio_value, cash + portfolio_value),
+    )
